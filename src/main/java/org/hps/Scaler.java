@@ -4,7 +4,8 @@ import io.fabric8.kubernetes.api.model.ServiceAccount;
 import io.fabric8.kubernetes.api.model.ServiceAccountBuilder;
 import io.fabric8.kubernetes.client.DefaultKubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClient;
-import org.apache.commons.math3.linear.Array2DRowRealMatrix;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
 import org.apache.kafka.clients.admin.*;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.KafkaFuture;
@@ -42,9 +43,8 @@ public class Scaler {
     static String choice;
     static Float uth;
     static Float dth;
-    static double prediction = 0;
     static String BOOTSTRAP_SERVERS;
-    static Boolean scaled = false;
+    static Long allowableLag;
 
     public static void main(String[] args) throws ExecutionException, InterruptedException {
         //TODO Externalize topic, cluster name, and all configurations
@@ -59,6 +59,7 @@ public class Scaler {
         uth= Float.parseFloat(System.getenv("uth"));
         dth= Float.parseFloat(System.getenv("dth"));
         CONSUMER_GROUP = System.getenv("CONSUMER_GROUP");
+        allowableLag = Long.parseLong(System.getenv("AllOWable_LAG"));
         mode = System.getenv("Mode");
         BOOTSTRAP_SERVERS = System.getenv("BOOTSTRAP_SERVERS");
         Properties props = new Properties();
@@ -116,7 +117,8 @@ public class Scaler {
                     admin.describeConsumerGroups(Collections.singletonList(Scaler.CONSUMER_GROUP));
             KafkaFuture<Map<String, ConsumerGroupDescription>> futureOfDescribeConsumerGroupsResult =
                     describeConsumerGroupsResult.all();
-            Map<String, ConsumerGroupDescription> consumerGroupDescriptionMap; consumerGroupDescriptionMap = futureOfDescribeConsumerGroupsResult.get();
+            Map<String, ConsumerGroupDescription> consumerGroupDescriptionMap;
+            consumerGroupDescriptionMap = futureOfDescribeConsumerGroupsResult.get();
             log.info("The consumer group {} is in state {}", Scaler.CONSUMER_GROUP,
                     consumerGroupDescriptionMap.get(Scaler.CONSUMER_GROUP).state().toString());
 
@@ -126,7 +128,11 @@ public class Scaler {
             for (MemberDescription md : previousConsumers) {
                 log.info("Member Description client id {}, consumer id {}, host {}", md.clientId(), md.consumerId(), md.host());
                 if (consumerGroupDescriptionMap.get(Scaler.CONSUMER_GROUP).members().contains(md)) {
-                    continue;
+                    if(!firstIteration) {
+                        log.info("Calling the consumer {} for its consumption rate ", md.host());
+                        callForConsumptionRate(md.host());
+                        continue;
+                    }
                 }
                 consumerToLag.remove(md);
                 maxConsumptionRatePerConsumer.remove(md);
@@ -144,7 +150,7 @@ public class Scaler {
                 if(mode.equalsIgnoreCase("proactive")){
                     //proactive(consumerGroupDescriptionMap);
                 } else if (mode.equalsIgnoreCase("reactive")) {
-                    reactive(consumerGroupDescriptionMap);
+                    reactiveLag(consumerGroupDescriptionMap);
                 } else if (mode.equalsIgnoreCase("eagerlazy")) {
                     //eagerlazy(consumerGroupDescriptionMap);
                 }
@@ -161,6 +167,28 @@ public class Scaler {
         }
     }
 
+    private static void callForConsumptionRate(String host) {
+
+        ManagedChannel managedChannel = ManagedChannelBuilder.forAddress(host.substring(1), 5002)
+                .usePlaintext()
+                .build();
+
+        RateServiceGrpc.RateServiceBlockingStub rateServiceBlockingStub
+                = RateServiceGrpc.newBlockingStub(managedChannel);
+
+        RateRequest rateRequest = RateRequest.newBuilder().setRate("Give me your rate")
+                //.setRaterequest()
+                .build();
+
+        log.info("connected to server {}", host);
+
+        //com.google.protobuf.Empty request = new com.google.protobuf.Empty();
+
+        RateResponse rateResponse = rateServiceBlockingStub.consumptionRate(rateRequest);
+        log.info("Received response on the rate: "+ rateResponse.getRate());
+        managedChannel.shutdown();
+
+    }
 
 
     static void reactive(Map<String, ConsumerGroupDescription> consumerGroupDescriptionMap) throws InterruptedException {
@@ -238,6 +266,89 @@ public class Scaler {
                     log.info("Sleeping additional 10 seconds");
                     Thread.sleep(10000);*/
 
+                } else {
+                    log.info("Not going to  down scale since replicas already one");
+                }
+            }
+        }
+        log.info("No scale is needed");
+        log.info("quitting scale decision");
+        log.info("=================================:");
+    }
+
+
+    //////
+
+
+    static void reactiveLag (Map<String, ConsumerGroupDescription> consumerGroupDescriptionMap) throws InterruptedException {
+        float totalConsumptionRate = 0;
+        float totalArrivalRate = 0;
+        long totallag = 0;
+        int size = consumerGroupDescriptionMap.get(Scaler.CONSUMER_GROUP).members().size();
+        log.info("Currently we have this number of consumers {}", size);
+        log.info("======================================================:");
+        for (MemberDescription memberDescription : consumerGroupDescriptionMap.get(Scaler.CONSUMER_GROUP).members()) {
+            long totalpoff = 0;
+            long totalcoff = 0;
+            long totalepoff = 0;
+            long totalecoff = 0;
+            for (TopicPartition tp : memberDescription.assignment().topicPartitions()) {
+                totalpoff += previousPartitionToCommittedOffset.get(tp);
+                totalcoff += currentPartitionToCommittedOffset.get(tp);
+                totalepoff += previousPartitionToLastOffset.get(tp);
+                totalecoff += currentPartitionToLastOffset.get(tp);
+            }
+
+            float consumptionRatePerConsumer;
+            float arrivalRatePerConsumer;
+
+            consumptionRatePerConsumer = (float) (totalcoff - totalpoff) / sleep;
+            arrivalRatePerConsumer = (float) (totalecoff - totalepoff) / sleep;
+
+
+            if (arrivalRatePerConsumer >= consumptionRatePerConsumer) {
+                // TODO do something
+            }
+            if (consumptionRatePerConsumer > maxConsumptionRatePerConsumer.getOrDefault(memberDescription, 0.0f)) {
+                maxConsumptionRatePerConsumer.put(memberDescription, consumptionRatePerConsumer);
+            }
+            totalConsumptionRate += consumptionRatePerConsumer;
+            totalArrivalRate += arrivalRatePerConsumer;
+            totallag += consumerToLag.get(memberDescription);
+        }
+        log.info("totalArrivalRate {}, totalconsumptionRate {}, totallag {}",
+                totalArrivalRate*1000, totalConsumptionRate*1000, totallag);
+        log.info("shall we up scale totalArrivalrate {}, max  consumption rate {}",
+                totalArrivalRate *1000, (size *poll* uth)/(float)SEC);
+
+        if ((totalArrivalRate *1000) > ((size *poll * uth)/(float)SEC) )  {
+            if (size < numberOfPartitions) {
+                log.info("Consumers are less than nb partition we can scale");
+                try (final KubernetesClient k8s = new DefaultKubernetesClient()) {
+                    ServiceAccount fabric8 = new ServiceAccountBuilder().withNewMetadata().withName("fabric8").endMetadata().build();
+                    k8s.serviceAccounts().inNamespace("default").createOrReplace(fabric8);
+                    k8s.apps().deployments().inNamespace("default").withName("cons1persec").scale(size + 1);
+                    log.info("since  arrival rate   {} is greater than  maximum consumed messages rate " +
+                                    "(size*poll/SEC) * uth ,  I up scaled  by one {}",
+                            totalArrivalRate * 1000, (size *poll*uth)/(float)SEC);
+
+
+                }
+            } else {
+                log.info("Consumers are equal to nb partitions we can not scale up anymore");
+            }
+        }
+        else if ((totalArrivalRate *1000)  < (((size-1) *poll * dth)/(float)SEC) && totalArrivalRate>0 && totallag < allowableLag )  {
+            try (final KubernetesClient k8s = new DefaultKubernetesClient()) {
+                ServiceAccount fabric8 = new ServiceAccountBuilder().withNewMetadata().withName("fabric8").endMetadata().build();
+                k8s.serviceAccounts().inNamespace("default").createOrReplace(fabric8);
+                int replicas = k8s.apps().deployments().inNamespace("default").withName("cons1persec").get().getSpec().getReplicas();
+                if (replicas > 1) {
+                    k8s.apps().deployments().inNamespace("default").withName("cons1persec").scale(replicas - 1);
+                    log.info("since arrival rate {} is lower than max consumption rate " +
+                                    " with size -1 times dth, I down scaled  by one {}",
+                            totalArrivalRate * 1000,
+                            ((size-1) *poll *dth)/(float)SEC);
                 } else {
                     log.info("Not going to  down scale since replicas already one");
                 }
